@@ -1,0 +1,59 @@
+{
+  "manifest_version": 3,
+  "name": "多 AI 对话保存器",
+  "version": "0.2.0",
+  "description": "把 ChatGPT、Gemini、Claude、Manus 等对话链接统一导入并保存为 JSON。",
+  "permissions": [
+    "sidePanel",
+    "activeTab",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": ["content-chatgpt.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
+      "js": ["content-gemini.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://claude.ai/*"
+      ],
+      "js": ["content-claude.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://manus.im/*",
+        "https://manus.ai/*"
+      ],
+      "js": ["content-manus.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "多 AI 对话保存器"
+  },
+  "icons": {}
+}
