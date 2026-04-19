@@ -1,17 +1,18 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { db } from '../storage/db'
+import { getNow } from '../lib/runtime'
 import {
-  buildImportedMessages,
-  buildImportedTurns,
-  cleanConversationSourceTitle,
+  flattenConversationTurns,
   deriveConversationTitle,
-  detectPlatformFromText,
+  normalizeConversationSourceUrl,
   normalizeImportedConversation,
   toStoredMessages,
+  upsertImportedConversation,
 } from '../lib/conversation'
 import { PasteParser } from './PasteParser'
 import type {
   Container,
+  ContainerAutoRefresh,
   ImportedConversation,
   MessageDraft,
   RunLogEntry,
@@ -65,38 +66,23 @@ function sanitizeFileName(name: string) {
   return name.replace(/[\\/:*?"<>|]+/g, '-').trim() || 'container'
 }
 
-function normalizeSourceUrl(value?: string) {
-  if (!value) return undefined
+function formatCountdown(target: string | undefined, now: number) {
+  if (!target) return '15:00'
 
-  try {
-    const url = new URL(value.trim())
-    url.hash = ''
-    const pathname = url.pathname.replace(/\/+$/, '') || '/'
-    return `${url.origin}${pathname}${url.search}`
-  } catch {
-    return value.trim()
-  }
-}
-
-function createImportTitle(containerName: string, drafts: MessageDraft[], sourceValue?: string, sourceTitle?: string) {
-  const importedMessages = buildImportedMessages(drafts)
-  const userDraft = importedMessages.find((draft) => draft.role === 'user' && draft.summary.trim())
-  const assistantDraft = importedMessages.find((draft) => draft.role === 'assistant' && draft.summary.trim())
-
-  return deriveConversationTitle({
-    sourceTitle,
-    userSummary: userDraft?.summary,
-    assistantSummary: assistantDraft?.summary,
-    sourceUrl: sourceValue,
-    fallbackTitle: containerName,
-  })
+  const diff = Math.max(0, new Date(target).getTime() - now)
+  const totalSeconds = Math.ceil(diff / 1000)
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
 }
 
 function getDisplayConversationTitle(conversation: ImportedConversation) {
-  const userSummary = conversation.turns.find((turn) => turn.user?.summary)?.user?.summary
-  const assistantSummary = conversation.turns.find((turn) => turn.assistant?.summary)?.assistant?.summary
+  const allTurns = flattenConversationTurns(conversation)
+  const userSummary = allTurns.find((turn) => turn.user?.summary)?.user?.summary
+  const assistantSummary = allTurns.find((turn) => turn.assistant?.summary)?.assistant?.summary
 
   return deriveConversationTitle({
+    customTitle: conversation.customTitle,
     sourceTitle: conversation.source.title,
     userSummary,
     assistantSummary,
@@ -114,6 +100,10 @@ export function ContainerDetail({
   const [view, setView] = useState<'main' | 'import'>('main')
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleDraft, setTitleDraft] = useState(container.name)
+  const [editingConversationId, setEditingConversationId] = useState<string | null>(null)
+  const [conversationTitleDraft, setConversationTitleDraft] = useState('')
+  const [countdownNow, setCountdownNow] = useState(() => getNow())
+  const [refreshingNow, setRefreshingNow] = useState(false)
 
   const importHistory = useMemo(() => getImportHistory(container), [container])
   const runLogs = useMemo(() => getRunLogs(container), [container])
@@ -128,13 +118,29 @@ export function ContainerDetail({
     }),
     [container.importedConversation, container.platform, importHistory],
   )
+  const autoRefresh = container.autoRefresh ?? {
+    enabled: false,
+    intervalMinutes: 15,
+  }
+
+  useEffect(() => {
+    if (!autoRefresh.enabled) return undefined
+
+    const timer = window.setInterval(() => {
+      setCountdownNow(getNow())
+    }, 1000)
+
+    return () => {
+      window.clearInterval(timer)
+    }
+  }, [autoRefresh.enabled])
 
   const updateContainer = async (updater: (current: Container) => Container) => {
     const stored = (await db.containers.get(container.id)) ?? container
     const next = updater(stored)
     await db.containers.put({
       ...next,
-      updatedAt: Date.now(),
+      updatedAt: getNow(),
     })
     await onContainersReload()
   }
@@ -173,48 +179,116 @@ export function ContainerDetail({
     drafts: MessageDraft[],
     sourceValue?: string,
     sourceTitle?: string,
-  ): Promise<'created' | 'updated'> => {
-    const platform = sourceValue ? detectPlatformFromText(sourceValue) : 'text'
-    const importedMessages = buildImportedMessages(drafts)
-    const importedTurns = buildImportedTurns(importedMessages)
-    const cleanedSourceTitle = cleanConversationSourceTitle(sourceTitle)
-    const normalizedSourceUrl = normalizeSourceUrl(sourceValue)
+  ): Promise<'created' | 'updated' | 'unchanged'> => {
     const currentHistory = getImportHistory(container)
+    const normalizedSourceUrl = normalizeConversationSourceUrl(sourceValue)
     const existingConversation = normalizedSourceUrl
-      ? currentHistory.find((item) => normalizeSourceUrl(item.source.url) === normalizedSourceUrl)
+      ? currentHistory.find((item) => normalizeConversationSourceUrl(item.source.url) === normalizedSourceUrl)
       : undefined
-
-    const importedConversation: ImportedConversation = {
-      id: existingConversation?.id ?? crypto.randomUUID(),
-      schemaVersion: '2.0',
-      title: createImportTitle(container.name, drafts, sourceValue, cleanedSourceTitle),
-      source: {
-        platform,
-        url: sourceValue?.trim() || undefined,
-        title: cleanedSourceTitle ?? existingConversation?.source.title,
-        importedAt: existingConversation?.source.importedAt ?? new Date().toISOString(),
-      },
-      turns: importedTurns,
-      stats: {
-        messageCount: importedMessages.length,
-        userCount: importedMessages.filter((draft) => draft.role === 'user').length,
-        assistantCount: importedMessages.filter((draft) => draft.role === 'assistant').length,
-      },
-    }
+    const result = upsertImportedConversation({
+      containerName: container.name,
+      drafts,
+      sourceValue,
+      sourceTitle,
+      existingConversation,
+    })
 
     await db.messages.replaceForContainer(container.id, toStoredMessages(container.id, drafts))
 
     await updateContainer((current) => ({
       ...current,
-      platform,
+      platform: result.conversation.source.platform,
       sourceUrl: sourceValue?.trim() || current.sourceUrl,
-      importedConversation,
+      importedConversation: result.conversation,
       importHistory: existingConversation
-        ? getImportHistory(current).map((item) => (item.id === existingConversation.id ? importedConversation : item))
-        : [...getImportHistory(current), importedConversation],
+        ? getImportHistory(current).map((item) => (item.id === existingConversation.id ? result.conversation : item))
+        : [...getImportHistory(current), result.conversation],
     }))
 
-    return existingConversation ? 'updated' : 'created'
+    return result.mode
+  }
+
+  const saveConversationTitle = async (conversationId: string) => {
+    const trimmed = conversationTitleDraft.trim()
+    const currentConversation = importHistory.find((item) => item.id === conversationId)
+    if (!currentConversation) {
+      setEditingConversationId(null)
+      setConversationTitleDraft('')
+      return
+    }
+
+    const nextCustomTitle = trimmed || undefined
+    const nextDisplayTitle = deriveConversationTitle({
+      customTitle: nextCustomTitle,
+      sourceTitle: currentConversation.source.title,
+      userSummary: flattenConversationTurns(currentConversation).find((turn) => turn.user?.summary)?.user?.summary,
+      assistantSummary: flattenConversationTurns(currentConversation).find((turn) => turn.assistant?.summary)?.assistant?.summary,
+      sourceUrl: currentConversation.source.url,
+      fallbackTitle: currentConversation.title,
+    })
+
+    await updateContainer((current) => ({
+      ...current,
+      importedConversation:
+        current.importedConversation?.id === conversationId
+          ? {
+              ...current.importedConversation,
+              customTitle: nextCustomTitle,
+              title: nextDisplayTitle,
+            }
+          : current.importedConversation,
+      importHistory: getImportHistory(current).map((conversation) =>
+        conversation.id === conversationId
+          ? {
+              ...conversation,
+              customTitle: nextCustomTitle,
+              title: nextDisplayTitle,
+            }
+          : conversation
+      ),
+    }))
+
+    setEditingConversationId(null)
+    setConversationTitleDraft('')
+  }
+
+  const toggleAutoRefresh = async () => {
+    const nextAutoRefresh: ContainerAutoRefresh = autoRefresh.enabled
+      ? {
+          ...autoRefresh,
+          enabled: false,
+          nextRunAt: undefined,
+        }
+      : {
+          enabled: true,
+          intervalMinutes: 15,
+          nextRunAt: new Date(getNow() + 15 * 60_000).toISOString(),
+        }
+
+    await updateContainer((current) => ({
+      ...current,
+      autoRefresh: nextAutoRefresh,
+    }))
+
+    chrome.runtime.sendMessage({ type: 'SYNC_AUTO_REFRESH' })
+  }
+
+  const refreshContainerNow = async () => {
+    setRefreshingNow(true)
+
+    try {
+      await new Promise<{ checked?: number; updated?: number; addedMessages?: number }>((resolve) => {
+        chrome.runtime.sendMessage(
+          { type: 'REFRESH_CONTAINER_NOW', containerId: container.id },
+          (response: { checked?: number; updated?: number; addedMessages?: number } | undefined) => {
+            resolve(response ?? {})
+          },
+        )
+      })
+      await onContainersReload()
+    } finally {
+      setRefreshingNow(false)
+    }
   }
 
   const clearImportedHistory = async () => {
@@ -269,9 +343,11 @@ export function ContainerDetail({
       summary,
       conversations: importHistory.map((conversation) => ({
         id: conversation.id,
-        title: conversation.title,
+        title: getDisplayConversationTitle(conversation),
+        customTitle: conversation.customTitle,
         source: conversation.source,
         turns: conversation.turns,
+        sections: conversation.sections ?? [],
         stats: conversation.stats,
       })),
     }
@@ -353,14 +429,31 @@ export function ContainerDetail({
               <span className="badge">{stats.conversationCount}</span>
             </div>
           </div>
-          <button
-            type="button"
-            className="icon-button danger-button"
-            onClick={() => void clearImportedHistory()}
-            disabled={stats.conversationCount === 0}
-          >
-            清空
-          </button>
+          <div className="inline-actions">
+            <button
+              type="button"
+              className={`btn ${autoRefresh.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => void toggleAutoRefresh()}
+            >
+              {autoRefresh.enabled ? '已开启定期更新' : '开启 15 分钟更新'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => void refreshContainerNow()}
+              disabled={refreshingNow}
+            >
+              {refreshingNow ? '检查中...' : autoRefresh.enabled ? formatCountdown(autoRefresh.nextRunAt, countdownNow) : '立即检查'}
+            </button>
+            <button
+              type="button"
+              className="icon-button danger-button"
+              onClick={() => void clearImportedHistory()}
+              disabled={stats.conversationCount === 0}
+            >
+              清空
+            </button>
+          </div>
         </div>
 
         {importHistory.length === 0 ? (
@@ -374,9 +467,38 @@ export function ContainerDetail({
               <article key={item.id} className="dashboard-item">
                 <div className="dashboard-item-topline">
                   <div>
-                    <h3 className="dashboard-item-title">{getDisplayConversationTitle(item)}</h3>
+                    {editingConversationId === item.id ? (
+                      <input
+                        className="field-input title-input"
+                        value={conversationTitleDraft}
+                        onChange={(event) => setConversationTitleDraft(event.target.value)}
+                        onBlur={() => void saveConversationTitle(item.id)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault()
+                            void saveConversationTitle(item.id)
+                          }
+                          if (event.key === 'Escape') {
+                            setEditingConversationId(null)
+                            setConversationTitleDraft('')
+                          }
+                        }}
+                        autoFocus
+                      />
+                    ) : (
+                      <button
+                        type="button"
+                        className="title-button dashboard-item-title"
+                        onClick={() => {
+                          setEditingConversationId(item.id)
+                          setConversationTitleDraft(getDisplayConversationTitle(item))
+                        }}
+                      >
+                        {getDisplayConversationTitle(item)}
+                      </button>
+                    )}
                     <p className="dashboard-item-meta">
-                      {PLATFORM_LABEL[item.source.platform]} · {item.stats.messageCount} 条消息 · {formatTimestamp(item.source.importedAt)}
+                      {PLATFORM_LABEL[item.source.platform]} · {item.stats.messageCount} 条消息 · {formatTimestamp(item.source.importedAt)} · {1 + (item.sections?.length ?? 0)} 个 section
                     </p>
                     {item.source.url ? (
                       <a

@@ -53,7 +53,7 @@ function extractFromUrl(url: string): Promise<{ sourceUrl?: string; sourceTitle?
 interface Props {
   container: Container
   onClose: () => void
-  onSave: (messages: MessageDraft[], sourceValue?: string, sourceTitle?: string) => Promise<'created' | 'updated'>
+  onSave: (messages: MessageDraft[], sourceValue?: string, sourceTitle?: string) => Promise<'created' | 'updated' | 'unchanged'>
   onLog: (message: string, level?: RunLogLevel) => Promise<void>
 }
 
@@ -82,7 +82,9 @@ export function PasteParser({ container, onClose, onSave, onLog }: Props) {
         await onLog(`开始导入链接：${trimmed}`)
         const result = await extractFromUrl(trimmed)
         const mode = await onSave(result.messages, result.sourceUrl ?? trimmed, result.sourceTitle)
-        if (mode === 'updated') {
+        if (mode === 'unchanged') {
+          await onLog(`链接已存在，暂无新增内容：${result.sourceUrl ?? trimmed}`, 'warning')
+        } else if (mode === 'updated') {
           await onLog(`链接已存在，已更新原记录：${result.sourceUrl ?? trimmed}`, 'warning')
         } else {
           await onLog(`导入完成：${result.sourceUrl ?? trimmed}，共 ${result.messages.length} 条消息`, 'success')
@@ -116,7 +118,9 @@ export function PasteParser({ container, onClose, onSave, onLog }: Props) {
       await onLog('开始抓取当前页面')
       const result = await extractFromActiveTab()
       const mode = await onSave(result.messages, result.sourceUrl, result.sourceTitle)
-      if (mode === 'updated') {
+      if (mode === 'unchanged') {
+        await onLog(`链接已存在，暂无新增内容：${result.sourceUrl ?? activeUrl ?? '当前页面'}`, 'warning')
+      } else if (mode === 'updated') {
         await onLog(`链接已存在，已更新原记录：${result.sourceUrl ?? activeUrl ?? '当前页面'}`, 'warning')
       } else {
         await onLog(`抓取完成：${result.sourceUrl ?? '当前页面'}，共 ${result.messages.length} 条消息`, 'success')

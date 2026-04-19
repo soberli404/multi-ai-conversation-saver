@@ -26,10 +26,26 @@ export interface ImportedTurn {
   assistant?: ImportedMessage
 }
 
+export interface ConversationStats {
+  messageCount: number
+  userCount: number
+  assistantCount: number
+}
+
+export interface ImportedConversationSection {
+  id: string
+  index: number
+  title: string
+  importedAt: string
+  turns: ImportedTurn[]
+  stats: ConversationStats
+}
+
 export interface ImportedConversation {
   id: string
-  schemaVersion: '1.0' | '2.0'
+  schemaVersion: '1.0' | '2.0' | '2.1'
   title: string
+  customTitle?: string
   source: {
     platform: Platform
     url?: string
@@ -37,11 +53,8 @@ export interface ImportedConversation {
     importedAt: string
   }
   turns: ImportedTurn[]
-  stats: {
-    messageCount: number
-    userCount: number
-    assistantCount: number
-  }
+  sections?: ImportedConversationSection[]
+  stats: ConversationStats
   conversation?: {
     title: string
     messages: ImportedMessage[]
@@ -55,6 +68,14 @@ export interface RunLogEntry {
   timestamp: string
 }
 
+export interface ContainerAutoRefresh {
+  enabled: boolean
+  intervalMinutes: number
+  nextRunAt?: string
+  lastCheckedAt?: string
+  lastUpdatedAt?: string
+}
+
 export interface Container {
   id: string
   name: string
@@ -63,6 +84,7 @@ export interface Container {
   importedConversation?: ImportedConversation
   importHistory?: ImportedConversation[]
   runLogs?: RunLogEntry[]
+  autoRefresh?: ContainerAutoRefresh
   tagIds: string[]
   createdAt: number
   updatedAt: number

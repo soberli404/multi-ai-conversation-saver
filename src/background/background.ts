@@ -1,3 +1,11 @@
+import {
+  normalizeIncomingMessages,
+  normalizeImportedConversation,
+  upsertImportedConversation,
+} from '../lib/conversation'
+import { db } from '../storage/db'
+import type { Container, ImportedConversation, RunLogEntry } from '../types'
+
 type ExtractedMessage = {
   id?: string
   role: 'user' | 'assistant'
@@ -11,6 +19,9 @@ type ExtractResult = {
   sourceTitle?: string
   error?: string
 }
+
+const AUTO_REFRESH_ALARM = 'codex-container-auto-refresh'
+const AUTO_REFRESH_INTERVAL_MINUTES = 15
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -153,6 +164,35 @@ function cleanSourceTitle(value?: string) {
     .trim() || undefined
 }
 
+function createRunLog(message: string, level: RunLogEntry['level']): RunLogEntry {
+  return {
+    id: crypto.randomUUID(),
+    level,
+    message,
+    timestamp: new Date().toISOString(),
+  }
+}
+
+function notifyContainersUpdated() {
+  chrome.runtime.sendMessage({ type: 'CONTAINERS_UPDATED' }, () => {
+    void chrome.runtime.lastError
+  })
+}
+
+async function syncAutoRefreshAlarm() {
+  const containers = await db.containers.getAll()
+  const hasEnabledContainer = containers.some((container) => container.autoRefresh?.enabled)
+
+  if (hasEnabledContainer) {
+    chrome.alarms.create(AUTO_REFRESH_ALARM, {
+      periodInMinutes: AUTO_REFRESH_INTERVAL_MINUTES,
+    })
+    return
+  }
+
+  chrome.alarms.clear(AUTO_REFRESH_ALARM)
+}
+
 function extractSourceTitleFromTab(tabId: number): Promise<string | undefined> {
   return new Promise((resolve) => {
     chrome.tabs.get(tabId, (tab) => {
@@ -237,6 +277,188 @@ async function extractFromTab(tabId: number): Promise<ExtractResult> {
   return lastResult
 }
 
+function openAndExtractUrl(url: string): Promise<ExtractResult> {
+  return new Promise((resolve) => {
+    chrome.tabs.create({ url, active: false }, (tab) => {
+      if (!tab?.id) {
+        resolve({ error: '无法打开目标链接' })
+        return
+      }
+
+      const tabId = tab.id
+      chrome.tabs.onUpdated.addListener(function listener(updatedId, info) {
+        if (updatedId !== tabId || info.status !== 'complete') return
+        chrome.tabs.onUpdated.removeListener(listener)
+
+        setTimeout(async () => {
+          const result = await extractFromTab(tabId)
+          chrome.tabs.remove(tabId).catch(() => {})
+          resolve(result)
+        }, 3500)
+      })
+    })
+  })
+}
+
+async function refreshConversationInContainer(
+  container: Container,
+  conversation: ImportedConversation,
+) {
+  if (!conversation.source.url) {
+    return {
+      conversation,
+      mode: 'unchanged' as const,
+      addedMessages: 0,
+      sourceUrl: undefined,
+    }
+  }
+
+  const result = await openAndExtractUrl(conversation.source.url)
+
+  if (result.error) {
+    throw new Error(result.error)
+  }
+
+  const drafts = normalizeIncomingMessages(result.messages ?? [])
+  const next = upsertImportedConversation({
+    containerName: container.name,
+    drafts,
+    sourceValue: result.sourceUrl ?? conversation.source.url,
+    sourceTitle: result.sourceTitle,
+    existingConversation: conversation,
+  })
+
+  return {
+    ...next,
+    sourceUrl: result.sourceUrl ?? conversation.source.url,
+  }
+}
+
+async function refreshContainerById(containerId: string) {
+  const container = await db.containers.get(containerId)
+  if (!container) {
+    return { checked: 0, updated: 0, addedMessages: 0 }
+  }
+
+  const history = (container.importHistory?.length
+    ? container.importHistory
+    : container.importedConversation
+      ? [container.importedConversation]
+      : []).map((conversation) => normalizeImportedConversation(conversation))
+
+  const now = new Date().toISOString()
+  const nextRunAt = new Date(Date.now() + AUTO_REFRESH_INTERVAL_MINUTES * 60_000).toISOString()
+
+  if (history.length === 0) {
+    await db.containers.put({
+      ...container,
+      autoRefresh: container.autoRefresh
+        ? {
+            ...container.autoRefresh,
+            nextRunAt,
+            lastCheckedAt: now,
+          }
+        : container.autoRefresh,
+      updatedAt: container.updatedAt,
+    })
+    return { checked: 0, updated: 0, addedMessages: 0 }
+  }
+
+  let nextHistory = history
+  let updatedConversations = 0
+  let addedMessages = 0
+  let hasRecordChanges = false
+  const logs: RunLogEntry[] = []
+
+  for (const conversation of history) {
+    if (!conversation.source.url) continue
+
+    try {
+      const refreshed = await refreshConversationInContainer(container, conversation)
+
+      if (refreshed.mode === 'unchanged') {
+        continue
+      }
+
+      hasRecordChanges = true
+      nextHistory = nextHistory.map((item) => (item.id === conversation.id ? refreshed.conversation : item))
+
+      if (refreshed.addedMessages > 0) {
+        updatedConversations += 1
+        addedMessages += refreshed.addedMessages
+        logs.unshift(
+          createRunLog(
+            `自动更新成功：${refreshed.conversation.customTitle || refreshed.conversation.title} 新增 ${refreshed.addedMessages} 条消息`,
+            'success',
+          ),
+        )
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '未知错误'
+      logs.unshift(
+        createRunLog(
+          `自动更新失败：${conversation.source.url}，原因：${message}`,
+          'error',
+        ),
+      )
+    }
+  }
+
+  const nextAutoRefresh = container.autoRefresh
+    ? {
+        ...container.autoRefresh,
+        enabled: true,
+        intervalMinutes: AUTO_REFRESH_INTERVAL_MINUTES,
+        nextRunAt,
+        lastCheckedAt: now,
+        lastUpdatedAt: addedMessages > 0 ? now : container.autoRefresh.lastUpdatedAt,
+      }
+    : undefined
+
+  const nextContainer: Container = {
+    ...container,
+    importedConversation: nextHistory.at(-1),
+    importHistory: nextHistory,
+    runLogs: [...logs, ...(container.runLogs ?? [])].slice(0, 120),
+    autoRefresh: nextAutoRefresh,
+    updatedAt: hasRecordChanges || logs.length > 0 ? Date.now() : container.updatedAt,
+  }
+
+  await db.containers.put(nextContainer)
+  if (hasRecordChanges || logs.length > 0 || container.autoRefresh?.enabled) {
+    notifyContainersUpdated()
+  }
+
+  return {
+    checked: history.length,
+    updated: updatedConversations,
+    addedMessages,
+  }
+}
+
+async function refreshAllEnabledContainers() {
+  const containers = await db.containers.getAll()
+  const enabledContainers = containers.filter((container) => container.autoRefresh?.enabled)
+
+  for (const container of enabledContainers) {
+    await refreshContainerById(container.id)
+  }
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === AUTO_REFRESH_ALARM) {
+    void refreshAllEnabledContainers()
+  }
+})
+
+chrome.runtime.onInstalled.addListener(() => {
+  void syncAutoRefreshAlarm()
+})
+
+chrome.runtime.onStartup.addListener(() => {
+  void syncAutoRefreshAlarm()
+})
+
 chrome.action.onClicked.addListener((tab) => {
   if (tab.id) {
     chrome.sidePanel.open({ tabId: tab.id })
@@ -258,23 +480,8 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, _sender,
 
   if (message.type === 'OPEN_AND_EXTRACT') {
     const url = String(message.url || '')
-    chrome.tabs.create({ url, active: false }, (tab) => {
-      if (!tab?.id) {
-        sendResponse({ error: '无法打开目标链接' })
-        return
-      }
-
-      const tabId = tab.id
-      chrome.tabs.onUpdated.addListener(function listener(updatedId, info) {
-        if (updatedId !== tabId || info.status !== 'complete') return
-        chrome.tabs.onUpdated.removeListener(listener)
-
-        setTimeout(async () => {
-          const result = await extractFromTab(tabId)
-          chrome.tabs.remove(tabId).catch(() => {})
-          sendResponse(result)
-        }, 3500)
-      })
+    void openAndExtractUrl(url).then((result) => {
+      sendResponse(result)
     })
     return true
   }
@@ -298,6 +505,21 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, _sender,
           sendResponse({ sourceTitle })
         }, 1500)
       })
+    })
+    return true
+  }
+
+  if (message.type === 'SYNC_AUTO_REFRESH') {
+    void syncAutoRefreshAlarm().then(() => {
+      sendResponse({ ok: true })
+    })
+    return true
+  }
+
+  if (message.type === 'REFRESH_CONTAINER_NOW') {
+    const containerId = String(message.containerId || '')
+    void refreshContainerById(containerId).then((result) => {
+      sendResponse(result)
     })
     return true
   }

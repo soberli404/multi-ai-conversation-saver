@@ -1,7 +1,7 @@
 import { type MouseEvent, useEffect, useMemo, useState } from 'react'
 import { db } from '../storage/db'
 import { getNow } from '../lib/runtime'
-import { cleanConversationSourceTitle } from '../lib/conversation'
+import { cleanConversationSourceTitle, isPreferredConversationTitle } from '../lib/conversation'
 import type { Container, Platform, Tag } from '../types'
 
 const PLATFORM_LABEL: Record<Platform, string> = {
@@ -81,8 +81,10 @@ export function ContainerBoard({ containers, tags, onSelect, onReload }: Props) 
         )
         .find(({ conversation }) =>
           Boolean(conversation.source.url)
-          && !conversation.source.title
-          && looksLikeSummaryTitle(conversation.title),
+          && (
+            !isPreferredConversationTitle(conversation.source.title)
+            || looksLikeSummaryTitle(conversation.title)
+          ),
         )
 
       if (!target?.conversation.source.url) return
@@ -99,13 +101,13 @@ export function ContainerBoard({ containers, tags, onSelect, onReload }: Props) 
       if (cancelled || response.error) return
 
       const repairedTitle = cleanConversationSourceTitle(response.sourceTitle)
-      if (!repairedTitle || repairedTitle === target.conversation.title) return
+      if (!repairedTitle) return
 
       const nextHistory = (target.container.importHistory ?? []).map((conversation) =>
         conversation.id === target.conversation.id
           ? {
               ...conversation,
-              title: repairedTitle,
+              title: conversation.customTitle ? conversation.title : repairedTitle,
               source: {
                 ...conversation.source,
                 title: repairedTitle,
@@ -121,7 +123,9 @@ export function ContainerBoard({ containers, tags, onSelect, onReload }: Props) 
           target.container.importedConversation?.id === target.conversation.id
             ? {
                 ...target.container.importedConversation,
-                title: repairedTitle,
+                title: target.container.importedConversation.customTitle
+                  ? target.container.importedConversation.title
+                  : repairedTitle,
                 source: {
                   ...target.container.importedConversation.source,
                   title: repairedTitle,

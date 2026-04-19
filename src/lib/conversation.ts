@@ -1,6 +1,8 @@
 import type {
+  ConversationStats,
   ConversationMessage,
   ImportedConversation,
+  ImportedConversationSection,
   ImportedMessage,
   ImportedTurn,
   ImportResult,
@@ -62,6 +64,7 @@ export function isPreferredConversationTitle(value?: string) {
 }
 
 export function deriveConversationTitle(options: {
+  customTitle?: string
   sourceTitle?: string
   userSummary?: string
   assistantSummary?: string
@@ -69,6 +72,7 @@ export function deriveConversationTitle(options: {
   fallbackTitle?: string
 }) {
   const {
+    customTitle,
     sourceTitle,
     userSummary,
     assistantSummary,
@@ -76,6 +80,7 @@ export function deriveConversationTitle(options: {
     fallbackTitle,
   } = options
 
+  if (customTitle?.trim()) return customTitle.trim()
   if (isPreferredConversationTitle(sourceTitle)) {
     return cleanConversationSourceTitle(sourceTitle) as string
   }
@@ -93,6 +98,19 @@ export function deriveConversationTitle(options: {
   }
 
   return fallbackTitle || '未命名对话'
+}
+
+export function normalizeConversationSourceUrl(value?: string) {
+  if (!value) return undefined
+
+  try {
+    const url = new URL(value.trim())
+    url.hash = ''
+    const pathname = url.pathname.replace(/\/+$/, '') || '/'
+    return `${url.origin}${pathname}${url.search}`
+  } catch {
+    return value.trim()
+  }
 }
 
 export function createDraftMessage(role: MessageRole, content: string, timestamp = new Date().toISOString()): MessageDraft {
@@ -371,14 +389,290 @@ export function buildImportedTurns(messages: ImportedMessage[]): ImportedTurn[] 
   return turns
 }
 
+export function flattenConversationTurns(conversation: ImportedConversation): ImportedTurn[] {
+  const normalized = normalizeImportedConversation(conversation)
+  const allTurns = [
+    ...normalized.turns,
+    ...(normalized.sections ?? []).flatMap((section) => section.turns),
+  ]
+
+  return allTurns.map((turn, index) => ({
+    ...turn,
+    index,
+  }))
+}
+
+export function flattenConversationMessages(conversation: ImportedConversation): ImportedMessage[] {
+  const messages = flattenConversationTurns(conversation).flatMap((turn) => {
+    const items: ImportedMessage[] = []
+    if (turn.user) items.push(turn.user)
+    if (turn.assistant) items.push(turn.assistant)
+    return items
+  })
+
+  return messages.map((message, index) => ({
+    ...message,
+    index,
+  }))
+}
+
+export function calculateConversationStats(turns: ImportedTurn[]): ConversationStats {
+  const messages = turns.flatMap((turn) => [turn.user, turn.assistant].filter(Boolean) as ImportedMessage[])
+
+  return {
+    messageCount: messages.length,
+    userCount: messages.filter((message) => message.role === 'user').length,
+    assistantCount: messages.filter((message) => message.role === 'assistant').length,
+  }
+}
+
+function buildConversationSection(turns: ImportedTurn[], index: number, importedAt: string): ImportedConversationSection {
+  return {
+    id: crypto.randomUUID(),
+    index,
+    title: `第 ${index + 1} 次更新`,
+    importedAt,
+    turns: turns.map((turn, turnIndex) => ({
+      ...turn,
+      index: turnIndex,
+    })),
+    stats: calculateConversationStats(turns),
+  }
+}
+
+function messageSignature(message: ImportedMessage) {
+  return `${message.role}\n${message.content.trim()}`
+}
+
+function getAppendedMessages(existingMessages: ImportedMessage[], nextMessages: ImportedMessage[]) {
+  const existingSignatures = existingMessages.map(messageSignature)
+  const nextSignatures = nextMessages.map(messageSignature)
+
+  const sameLengthAndSameOrder =
+    existingSignatures.length === nextSignatures.length
+    && existingSignatures.every((signature, index) => signature === nextSignatures[index])
+
+  if (sameLengthAndSameOrder) {
+    return []
+  }
+
+  if (
+    nextSignatures.length > existingSignatures.length
+    && existingSignatures.every((signature, index) => signature === nextSignatures[index])
+  ) {
+    return nextMessages.slice(existingMessages.length)
+  }
+
+  return null
+}
+
+function summarizeTurns(turns: ImportedTurn[]) {
+  const userSummary = turns.find((turn) => turn.user?.summary)?.user?.summary
+  const assistantSummary = turns.find((turn) => turn.assistant?.summary)?.assistant?.summary
+  return { userSummary, assistantSummary }
+}
+
+function buildConversationTitle(
+  customTitle: string | undefined,
+  sourceTitle: string | undefined,
+  sourceUrl: string | undefined,
+  turns: ImportedTurn[],
+  fallbackTitle: string,
+) {
+  const { userSummary, assistantSummary } = summarizeTurns(turns)
+  return deriveConversationTitle({
+    customTitle,
+    sourceTitle,
+    userSummary,
+    assistantSummary,
+    sourceUrl,
+    fallbackTitle,
+  })
+}
+
+export function upsertImportedConversation(options: {
+  containerName: string
+  drafts: MessageDraft[]
+  sourceValue?: string
+  sourceTitle?: string
+  existingConversation?: ImportedConversation
+}): {
+  conversation: ImportedConversation
+  mode: 'created' | 'updated' | 'unchanged'
+  addedMessages: number
+} {
+  const {
+    containerName,
+    drafts,
+    sourceValue,
+    sourceTitle,
+    existingConversation,
+  } = options
+
+  const platform = sourceValue ? detectPlatformFromText(sourceValue) : 'text'
+  const cleanedSourceTitle = cleanConversationSourceTitle(sourceTitle)
+  const importedMessages = buildImportedMessages(drafts)
+  const importedTurns = buildImportedTurns(importedMessages)
+  const importedAt = new Date().toISOString()
+
+  if (!existingConversation) {
+    const title = buildConversationTitle(
+      undefined,
+      cleanedSourceTitle,
+      sourceValue?.trim(),
+      importedTurns,
+      containerName,
+    )
+
+    return {
+      conversation: {
+        id: crypto.randomUUID(),
+        schemaVersion: '2.1',
+        title,
+        source: {
+          platform,
+          url: sourceValue?.trim() || undefined,
+          title: cleanedSourceTitle,
+          importedAt,
+        },
+        turns: importedTurns,
+        sections: [],
+        stats: calculateConversationStats(importedTurns),
+      },
+      mode: 'created',
+      addedMessages: importedMessages.length,
+    }
+  }
+
+  const current = normalizeImportedConversation(existingConversation)
+  const existingMessages = flattenConversationMessages(current)
+  const appendedMessages = getAppendedMessages(existingMessages, importedMessages)
+  const nextSourceTitle = cleanedSourceTitle ?? current.source.title
+  const nextImportedAt = current.source.importedAt || importedAt
+  const nextSourceUrl = sourceValue?.trim() || current.source.url
+
+  const rebuildConversation = (turns: ImportedTurn[], sections: ImportedConversationSection[], mode: 'updated' | 'unchanged', addedMessages: number) => {
+    const title = buildConversationTitle(
+      current.customTitle,
+      nextSourceTitle,
+      nextSourceUrl,
+      turns,
+      current.title || containerName,
+    )
+
+    const aggregateTurns = [
+      ...turns,
+      ...sections.flatMap((section) => section.turns),
+    ].map((turn, index) => ({
+      ...turn,
+      index,
+    }))
+
+    return {
+      conversation: {
+        ...current,
+        schemaVersion: '2.1' as const,
+        title,
+        source: {
+          ...current.source,
+          platform,
+          url: nextSourceUrl,
+          title: nextSourceTitle,
+          importedAt: nextImportedAt,
+        },
+        turns,
+        sections,
+        stats: calculateConversationStats(aggregateTurns),
+      },
+      mode,
+      addedMessages,
+    }
+  }
+
+  if (appendedMessages && appendedMessages.length > 0) {
+    const appendedTurns = buildImportedTurns(appendedMessages)
+    const sections = [
+      ...(current.sections ?? []),
+      buildConversationSection(appendedTurns, current.sections?.length ?? 0, importedAt),
+    ]
+    return rebuildConversation(current.turns, sections, 'updated', appendedMessages.length)
+  }
+
+  const incomingStats = calculateConversationStats(importedTurns)
+  const shouldReplaceBrokenConversation =
+    current.stats.assistantCount === 0
+    && incomingStats.assistantCount > 0
+    && importedMessages.length >= existingMessages.length
+
+  if (shouldReplaceBrokenConversation) {
+    return rebuildConversation(importedTurns, [], 'updated', importedMessages.length)
+  }
+
+  const title = buildConversationTitle(
+    current.customTitle,
+    nextSourceTitle,
+    nextSourceUrl,
+    current.turns,
+    current.title || containerName,
+  )
+
+  const hasMetadataChange =
+    title !== current.title
+    || nextSourceTitle !== current.source.title
+    || nextSourceUrl !== current.source.url
+    || platform !== current.source.platform
+
+  return {
+    conversation: {
+      ...current,
+      schemaVersion: '2.1',
+      title,
+      source: {
+        ...current.source,
+        platform,
+        url: nextSourceUrl,
+        title: nextSourceTitle,
+        importedAt: nextImportedAt,
+      },
+    },
+    mode: hasMetadataChange ? 'updated' : 'unchanged',
+    addedMessages: 0,
+  }
+}
+
 export function normalizeImportedConversation(conversation: ImportedConversation): ImportedConversation {
-  if (conversation.schemaVersion === '2.0' && conversation.turns?.length) {
+  if ((conversation.schemaVersion === '2.0' || conversation.schemaVersion === '2.1') && conversation.turns?.length) {
+    const turns = conversation.turns.map((turn, index) => ({
+      ...turn,
+      index,
+    }))
+    const sections = (conversation.sections ?? []).map((section, sectionIndex) => ({
+      ...section,
+      index: sectionIndex,
+      turns: section.turns.map((turn, turnIndex) => ({
+        ...turn,
+        index: turnIndex,
+      })),
+      stats: section.stats ?? calculateConversationStats(section.turns),
+    }))
+    const aggregateTurns = [
+      ...turns,
+      ...sections.flatMap((section) => section.turns),
+    ].map((turn, index) => ({
+      ...turn,
+      index,
+    }))
+
     return {
       ...conversation,
-      turns: conversation.turns.map((turn, index) => ({
-        ...turn,
-        index,
-      })),
+      schemaVersion: '2.1',
+      source: {
+        ...conversation.source,
+        title: cleanConversationSourceTitle(conversation.source?.title),
+      },
+      turns,
+      sections,
+      stats: calculateConversationStats(aggregateTurns),
     }
   }
 
@@ -399,17 +693,15 @@ export function normalizeImportedConversation(conversation: ImportedConversation
 
   return {
     id: conversation.id,
-    schemaVersion: '2.0',
+    schemaVersion: '2.1',
     title: conversation.title || conversation.conversation?.title || '未命名对话',
+    customTitle: conversation.customTitle,
     source: {
       ...conversation.source,
       title: cleanConversationSourceTitle(conversation.source?.title),
     },
     turns,
-    stats: {
-      messageCount: importedMessages.length,
-      userCount: importedMessages.filter((message) => message.role === 'user').length,
-      assistantCount: importedMessages.filter((message) => message.role === 'assistant').length,
-    },
+    sections: [],
+    stats: calculateConversationStats(turns),
   }
 }
