@@ -1,6 +1,8 @@
 # 多 AI 对话保存器
 
-一个轻量的浏览器侧边栏插件，用来把不同 AI 平台里的对话链接统一保存下来，并导出成结构化 JSON。
+很多时候，我们需要在不同 AI 之间来回切换：ChatGPT、Gemini、Claude、Manus，甚至不同的 coding 工具。问题是，一旦切换平台，原来的上下文很容易崩塌，你不得不重新解释项目背景、需求和历史对话。
+
+多 AI 对话保存器就是为这个痛点做的。它可以把对话直接导出成结构化 JSON，而不是只导出成 Markdown 文档。这样你在新的 AI 聊天或 coding 软件里，不需要重新介绍项目，只要把 JSON 文件上传进去，就能更低成本地续上上下文。
 
 ## 这个产品可以干什么
 
@@ -18,13 +20,11 @@
 - Gemini
 - Claude
 - Manus
-- 普通网页兜底提取
 - 纯文本粘贴解析
 
 ## 如何本地运行
 
 ```bash
-cd "/Users/mac/Desktop/windsurf testing/个人项目/2-AI-Container/codex-container-copilot"
 npm install
 npm run build
 ```
@@ -44,7 +44,6 @@ npm run build
 1. 先执行 `npm run build`
 2. 把 `dist` 目录压缩成 zip
 3. 如果是自己本地安装，仍然建议先解压后再通过“加载已解压的扩展程序”导入
-4. 如果是团队内部交付，可直接把 zip 发给对方，由对方解压后加载
 
 ## 导出的 JSON 里有什么
 
