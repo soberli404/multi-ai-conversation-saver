@@ -71,3 +71,5 @@ npm run build
 ## 开发者微信
 
 微信名：欢喜
+
+![开发者微信二维码](assets/wechat-qr.png)
