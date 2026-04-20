@@ -321,7 +321,7 @@ export function ContainerBoard({ containers, tags, onSelect, onReload }: Props) 
                     </div>
                     <button
                       type="button"
-                      className="icon-button"
+                      className="icon-button action-outline-button"
                       onClick={(event) => void removeContainer(container, event)}
                       aria-label={`删除 ${container.name}`}
                     >

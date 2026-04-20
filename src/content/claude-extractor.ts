@@ -8,345 +8,853 @@ interface ExtractedMessage {
 
 interface MessageCandidate {
   role: 'user' | 'assistant'
-  content: string
+  node: Element
+  text: string
   top: number
-  bottom: number
-  left: number
+  rect?: DOMRect | null
 }
 
-function cleanText(value: string) {
-  return value.replace(/\n{3,}/g, '\n\n').trim()
+const SELECTORS = {
+  main: 'main, [role="main"], article',
+  user: '[data-testid="user-message"], .font-user-message',
+  assistant: '.font-claude-message, .font-claude-response',
+  turn: '.group\\/conversation-turn, [class*="conversation-turn"]',
+  prose: '.font-claude-message .prose, .font-claude-response .prose, .prose',
+} as const
+
+const NOISE_ANCESTORS = [
+  'nav',
+  'aside',
+  'header',
+  'footer',
+  'form',
+  'dialog',
+  '[role="navigation"]',
+  '[role="banner"]',
+  '[role="menu"]',
+  '[role="dialog"]',
+  '[aria-modal="true"]',
+  '[data-radix-popper-content-wrapper]',
+].join(', ')
+
+const DROP_INSIDE_MESSAGE = [
+  'script',
+  'style',
+  'noscript',
+  'svg',
+  'button',
+  'input',
+  'textarea',
+  'select',
+  'option',
+  '[role="button"]',
+  '[role="menu"]',
+  '[aria-hidden="true"]',
+].join(', ')
+
+const EXACT_UI_LINES = new Set([
+  'New chat',
+  'Chats',
+  'Projects',
+  'Artifacts',
+  'Customize Claude',
+  'Customize Chats',
+  'Recents',
+  'Settings',
+  'Report',
+  'Share',
+  'Copy',
+  'Retry',
+  'Start your own conversation',
+  'Sign in',
+  'Create account',
+  'Continue with Google',
+  'Claude can make mistakes. Please double-check responses.',
+  'Shared by',
+])
+
+const DATE_LINE_PATTERNS = [
+  /^\d{1,2}月\d{1,2}日(?:\s*(?:周|星期)[一二三四五六日天])?$/i,
+  /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+\d{1,2}(?:,\s*\d{4})?$/i,
+  /^\d{4}[/-]\d{1,2}[/-]\d{1,2}$/i,
+  /^\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?$/i,
+  /^\d{1,2}:\d{2}$/,
+  /^(today|yesterday)$/i,
+] as const
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function getSourceTitle() {
-  const metaTitle = document.querySelector('meta[property="og:title"]')?.getAttribute('content')
-    || document.querySelector('meta[name="twitter:title"]')?.getAttribute('content')
-  const headingTitle = cleanText(
-    (document.querySelector('main h1, [role="main"] h1, header h1') as HTMLElement | null)?.innerText || '',
-  )
+function cleanText(raw: string) {
+  if (!raw) return ''
 
-  return metaTitle?.trim() || headingTitle || document.title.trim() || undefined
-}
+  const text = raw
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\r/g, '\n')
 
-function hasAssistant(messages: ExtractedMessage[]) {
-  return messages.some((message) => message.role === 'assistant')
-}
+  let lines = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
 
-function hasUser(messages: ExtractedMessage[]) {
-  return messages.some((message) => message.role === 'user')
-}
-
-function uniqueMessages(messages: ExtractedMessage[]) {
-  const seen = new Set<string>()
-  return messages.filter((message) => {
-    const key = `${message.role}:${message.content}`
-    if (!message.content || seen.has(key)) return false
-    seen.add(key)
+  lines = lines.filter((line) => {
+    if (isDateOnlyLine(line)) return false
+    if (EXACT_UI_LINES.has(line)) return false
+    if (/^Shared by\b/i.test(line)) return false
     return true
   })
+
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
 }
 
-function looksLikeNoiseText(content: string) {
-  const normalized = content.trim().toLowerCase()
-  if (!normalized) return true
-  if (normalized === 'pasted') return true
-  if (normalized.length < 8) return true
-
-  const menuKeywords = [
-    'new chat',
-    'customize chats',
-    'projects',
-    'artifacts',
-    'starred',
-    'start your own conversation',
-    'shared by',
-    'report',
-    'content may include unverified',
-    'this is a copy of a chat between claude',
-  ]
-
-  const hits = menuKeywords.filter((keyword) => normalized.includes(keyword)).length
-  if (hits >= 2) return true
-  if (normalized.includes('this is a copy of a chat between claude')) return true
-
-  return false
+function isDateOnlyLine(line: string) {
+  const normalized = line.trim()
+  return DATE_LINE_PATTERNS.some((pattern) => pattern.test(normalized))
 }
 
-function isDateDivider(content: string) {
-  const normalized = content.trim()
-  return /^(?:\d{1,2}月\d{1,2}日|\d{1,2}:\d{2}|today|yesterday)$/i.test(normalized)
+function safeRect(node: Element) {
+  try {
+    return node.getBoundingClientRect()
+  } catch {
+    return null
+  }
 }
 
-function isVisibleElement(htmlEl: HTMLElement) {
-  const rect = htmlEl.getBoundingClientRect()
-  const style = window.getComputedStyle(htmlEl)
+function isVisible(node: Element) {
+  const rect = safeRect(node)
+  if (!rect || rect.width <= 0 || rect.height <= 0) return false
 
-  if (style.display === 'none' || style.visibility === 'hidden') return false
-  if (rect.width < 40 || rect.height < 20) return false
-
-  return true
+  const style = window.getComputedStyle(node as HTMLElement)
+  return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'
 }
 
-function inferRoleFromContent(content: string, fallbackIndex: number): 'user' | 'assistant' {
-  const normalized = content.trim()
+function isInsideNoise(node: Element) {
+  if (node.matches(`${SELECTORS.user}, ${SELECTORS.assistant}`)) return false
+  return Boolean(node.closest(NOISE_ANCESTORS))
+}
 
-  if (/^(?:human|user|you|我|用户|问题|提问|prompt)[\s:：\n]/i.test(normalized)) {
-    return 'user'
+function cleanDocumentTitle(value: string) {
+  return cleanText(
+    String(value || '')
+      .replace(/\s*[|-]\s*Claude\s*$/i, '')
+      .replace(/^Claude\s*[|-]\s*/i, '')
+      .replace(/^Shared Conversation\s*[|-]\s*/i, ''),
+  )
+}
+
+function getSourceTitle(messages?: ExtractedMessage[]) {
+  const metaTitle = document.querySelector('meta[property="og:title"]')?.getAttribute('content')
+    || document.querySelector('meta[name="twitter:title"]')?.getAttribute('content')
+
+  const mainHeading = Array.from(document.querySelectorAll('main h1, [role="main"] h1, article h1'))
+    .map((el) => cleanText((el as HTMLElement).innerText || ''))
+    .find((value) => isGoodTitle(value))
+
+  const docTitle = cleanDocumentTitle(document.title)
+
+  if (isGoodTitle(metaTitle || '')) return cleanText(metaTitle as string)
+  if (mainHeading) return mainHeading
+  if (isGoodTitle(docTitle)) return docTitle
+
+  if (messages?.length) {
+    return extractTitleFromMessages(messages)
   }
 
-  if (
-    /^(?:claude|assistant|当然|好的|可以|sure|here|based on|i can|i'll|下面|以下)/i.test(normalized)
-    || normalized.length > 220
-  ) {
-    return 'assistant'
-  }
-
-  return fallbackIndex % 2 === 0 ? 'user' : 'assistant'
+  return undefined
 }
 
-function inferRoleFromLayout(htmlEl: HTMLElement) {
-  const rect = htmlEl.getBoundingClientRect()
-  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1280
+function extractShareId() {
+  const match = window.location.pathname.match(/\/share\/([^/?#]+)/)
+  return match?.[1] ?? `claude-${Date.now()}`
+}
 
-  let current: HTMLElement | null = htmlEl
-  let depth = 0
+function fingerprint(role: 'user' | 'assistant', text: string) {
+  return `${role}:${cleanText(text).replace(/\s+/g, ' ').toLowerCase()}`
+}
 
-  while (current && depth < 4) {
-    const fingerprint = [
-      current.tagName,
-      current.getAttribute('data-testid'),
-      current.getAttribute('aria-label'),
-      current.className,
-    ]
+function compareNodeOrder(a: Element, b: Element) {
+  if (a === b) return 0
+  const pos = a.compareDocumentPosition(b)
+  if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1
+  if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1
+  return (safeRect(a)?.top ?? 0) - (safeRect(b)?.top ?? 0)
+}
+
+function lowestCommonAncestor(nodes: Element[]) {
+  if (!nodes.length) return null
+
+  const paths = nodes.map((node) => {
+    const path: Element[] = []
+    let current: Element | null = node
+    while (current) {
+      path.unshift(current)
+      current = current.parentElement
+    }
+    return path
+  })
+
+  let lca: Element | null = null
+  const minLength = Math.min(...paths.map((path) => path.length))
+
+  for (let index = 0; index < minLength; index += 1) {
+    const candidate = paths[0][index]
+    if (paths.every((path) => path[index] === candidate)) {
+      lca = candidate
+    } else {
+      break
+    }
+  }
+
+  return lca
+}
+
+function readCodeLanguage(node: Element) {
+  const className = String((node as HTMLElement).className || '')
+  const match = className.match(/language-([a-z0-9_-]+)/i)
+  return match?.[1] ?? ''
+}
+
+function isBlockTag(tagName: string) {
+  return [
+    'DIV',
+    'P',
+    'SECTION',
+    'ARTICLE',
+    'MAIN',
+    'BLOCKQUOTE',
+    'UL',
+    'OL',
+    'TABLE',
+    'THEAD',
+    'TBODY',
+    'TR',
+    'H1',
+    'H2',
+    'H3',
+    'H4',
+    'H5',
+    'H6',
+    'PRE',
+  ].includes(tagName)
+}
+
+function cleanInlineText(value: string) {
+  return cleanText(value).replace(/\n+/g, ' ')
+}
+
+function nodeToMarkdownishText(node: Node): string {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return node.nodeValue || ''
+  }
+
+  if (node.nodeType !== Node.ELEMENT_NODE) {
+    return ''
+  }
+
+  const element = node as Element
+  if (element.matches(DROP_INSIDE_MESSAGE)) {
+    return ''
+  }
+
+  if ((element as HTMLElement).innerText && isInsideNoise(element)) {
+    return ''
+  }
+
+  if (element.tagName === 'BR') {
+    return '\n'
+  }
+
+  if (element.tagName === 'PRE') {
+    const codeNode = element.querySelector('code') || element
+    const code = (codeNode.textContent || '').trim()
+    if (!code) return ''
+    const lang = readCodeLanguage(codeNode)
+    return `\n\`\`\`${lang}\n${code}\n\`\`\`\n`
+  }
+
+  if (element.tagName === 'CODE' && !element.closest('pre')) {
+    const text = cleanInlineText(element.textContent || '')
+    return text ? `\`${text}\`` : ''
+  }
+
+  if (element.tagName === 'LI') {
+    const body = Array.from(element.childNodes).map(nodeToMarkdownishText).join('').trim()
+    return body ? `\n- ${body}\n` : ''
+  }
+
+  if (element.tagName === 'TR') {
+    const cells = Array.from(element.children)
+      .filter((child) => ['TD', 'TH'].includes(child.tagName))
+      .map((child) => cleanInlineText(nodeToMarkdownishText(child)))
       .filter(Boolean)
-      .join(' ')
-      .toLowerCase()
-
-    if (
-      /\b(human|user|prompt)\b/.test(fingerprint)
-      || fingerprint.includes('user-message')
-      || fingerprint.includes('human-message')
-      || fingerprint.includes('justify-end')
-      || fingerprint.includes('items-end')
-      || fingerprint.includes('self-end')
-      || fingerprint.includes('ml-auto')
-      || fingerprint.includes('text-right')
-    ) {
-      return 'user'
-    }
-
-    if (
-      /\b(assistant|claude|bot|response)\b/.test(fingerprint)
-      || fingerprint.includes('assistant-message')
-      || fingerprint.includes('model-message')
-      || fingerprint.includes('prose')
-      || fingerprint.includes('markdown')
-      || fingerprint.includes('font-claude')
-    ) {
-      return 'assistant'
-    }
-
-    current = current.parentElement
-    depth += 1
+    return cells.length ? `\n| ${cells.join(' | ')} |\n` : ''
   }
 
-  if (rect.left > viewportWidth * 0.38 && rect.width < viewportWidth * 0.62) {
-    return 'user'
+  const childText = Array.from(element.childNodes).map(nodeToMarkdownishText).join('')
+  if (isBlockTag(element.tagName)) {
+    const trimmed = childText.trim()
+    return trimmed ? `\n${trimmed}\n` : ''
   }
 
-  if (rect.left < viewportWidth * 0.26 && rect.width > viewportWidth * 0.34) {
-    return 'assistant'
+  return childText
+}
+
+function elementToReadableText(node: Element) {
+  return cleanText(nodeToMarkdownishText(node))
+}
+
+function looksLikeMessageArray(value: unknown): value is Array<Record<string, unknown>> {
+  if (!Array.isArray(value) || value.length < 2) return false
+
+  let roleHits = 0
+  let contentHits = 0
+
+  for (const item of value.slice(0, 20)) {
+    if (!item || typeof item !== 'object') continue
+    if (readRole(item)) roleHits += 1
+    if (readContent(item)) contentHits += 1
+  }
+
+  return roleHits >= 2 && contentHits >= 2
+}
+
+function readRole(message: Record<string, unknown>) {
+  const raw = String(
+    message.role
+    ?? message.sender
+    ?? message.author
+    ?? message.type
+    ?? message.from
+    ?? '',
+  ).toLowerCase()
+
+  if (/human|user/.test(raw)) return 'user' as const
+  if (/assistant|claude|model|bot/.test(raw)) return 'assistant' as const
+  return null
+}
+
+function normalizeContentValue(value: unknown): string {
+  if (!value) return ''
+  if (typeof value === 'string') return cleanText(value)
+
+  if (Array.isArray(value)) {
+    return cleanText(value.map((part) => normalizeContentValue(part)).filter(Boolean).join('\n\n'))
+  }
+
+  if (typeof value === 'object') {
+    const objectValue = value as Record<string, unknown>
+    return normalizeContentValue(
+      objectValue.text
+      ?? objectValue.value
+      ?? objectValue.content
+      ?? objectValue.markdown
+      ?? objectValue.body,
+    )
+  }
+
+  return ''
+}
+
+function readContent(message: Record<string, unknown>) {
+  return normalizeContentValue(
+    message.text
+    ?? message.markdown
+    ?? message.body
+    ?? message.message
+    ?? message.content
+    ?? message.contents,
+  )
+}
+
+function findNearbyTitle(root: unknown) {
+  const titles: string[] = []
+  const seen = new WeakSet<object>()
+
+  function walk(value: unknown) {
+    if (!value || typeof value !== 'object') return
+    if (seen.has(value as object)) return
+    seen.add(value as object)
+
+    if (!Array.isArray(value)) {
+      for (const key of ['title', 'name', 'summary']) {
+        const candidate = (value as Record<string, unknown>)[key]
+        if (typeof candidate === 'string' && isGoodTitle(candidate)) {
+          titles.push(cleanText(candidate))
+        }
+      }
+    }
+
+    for (const child of Object.values(value as Record<string, unknown>)) {
+      if (child && typeof child === 'object') {
+        walk(child)
+      }
+    }
+  }
+
+  walk(root)
+  return titles[0] || ''
+}
+
+function buildMessagesFromRaw(rawMessages: Array<Record<string, unknown>>) {
+  return rawMessages
+    .map((message) => ({
+      id: `${extractShareId()}-${crypto.randomUUID()}`,
+      role: readRole(message),
+      content: readContent(message),
+      timestamp: new Date().toISOString(),
+      selected: true,
+    }))
+    .filter((message): message is ExtractedMessage => Boolean(message.role && message.content))
+}
+
+function extractFromEmbeddedJson() {
+  const scripts = Array.from(document.querySelectorAll('script[type="application/json"], script#__NEXT_DATA__, script'))
+
+  for (const script of scripts) {
+    const raw = script.textContent?.trim()
+    if (!raw || raw.length < 20 || raw.length > 10_000_000) continue
+    if (!(raw.startsWith('{') || raw.startsWith('['))) continue
+    if (!/(message|conversation|chat|claude)/i.test(raw)) continue
+
+    try {
+      const json = JSON.parse(raw) as unknown
+      const candidate = findConversationInJson(json)
+      if (!candidate?.messages?.length) continue
+
+      const messages = buildMessagesFromRaw(candidate.messages)
+      if (!validateMessages(messages).ok) continue
+
+      return {
+        messages,
+        sourceTitle: candidate.title || getSourceTitle(messages),
+      }
+    } catch {
+      continue
+    }
   }
 
   return null
 }
 
-function shouldSkipElement(htmlEl: HTMLElement, content: string) {
-  if (!isVisibleElement(htmlEl)) return true
-  if (htmlEl.closest('nav, aside, header, footer, [role="navigation"], [role="banner"]')) return true
-  if (htmlEl.tagName === 'BUTTON') return true
-  if (isDateDivider(content)) return true
-  if (looksLikeNoiseText(content)) return true
-  return false
-}
+function findConversationInJson(root: unknown): { messages: Array<Record<string, unknown>>; title: string } | null {
+  const seen = new WeakSet<object>()
+  const candidates: Array<{ messages: Array<Record<string, unknown>>; title: string }> = []
 
-function dedupeCandidates(candidates: MessageCandidate[]) {
-  return candidates.filter((candidate, index, all) => {
-    return !all.some((other, otherIndex) => {
-      if (otherIndex === index) return false
-      if (other.role !== candidate.role) return false
-      const nearSamePosition = Math.abs(other.top - candidate.top) < 24
-      const containsCandidate = other.content.length > candidate.content.length && other.content.includes(candidate.content)
-      return nearSamePosition && containsCandidate
-    })
-  })
-}
+  function walk(value: unknown) {
+    if (!value || typeof value !== 'object') return
+    if (seen.has(value as object)) return
+    seen.add(value as object)
 
-function collectAssistantCandidates() {
-  const main = document.querySelector('main, [role="main"]') as HTMLElement | null
-  if (!main) return [] as MessageCandidate[]
+    if (Array.isArray(value)) {
+      if (looksLikeMessageArray(value)) {
+        candidates.push({
+          messages: value,
+          title: findNearbyTitle(root),
+        })
+      }
 
-  const selectors = ['.prose', '[class*="prose"]', '[class*="markdown"]']
-  const nodes = Array.from(main.querySelectorAll(selectors.join(', ')))
-  const candidates: MessageCandidate[] = []
+      value.forEach((item) => walk(item))
+      return
+    }
 
-  for (const node of nodes) {
-    const htmlEl = node as HTMLElement
-    if (htmlEl.closest('nav, aside, header, footer, [role="navigation"], [role="banner"]')) continue
-    if (!isVisibleElement(htmlEl)) continue
-    if (htmlEl.parentElement?.closest(selectors.join(', '))) continue
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (Array.isArray(child) && /messages|chat_messages|turns|conversation/i.test(key) && looksLikeMessageArray(child)) {
+        candidates.push({
+          messages: child,
+          title:
+            String((value as Record<string, unknown>).title || (value as Record<string, unknown>).name || (value as Record<string, unknown>).summary || '')
+            || findNearbyTitle(root),
+        })
+      }
 
-    const content = cleanText(htmlEl.innerText || '')
-    if (shouldSkipElement(htmlEl, content)) continue
-
-    const rect = htmlEl.getBoundingClientRect()
-    if (rect.left > (window.innerWidth || 1280) * 0.35) continue
-
-    candidates.push({
-      role: 'assistant',
-      content,
-      top: rect.top,
-      bottom: rect.bottom,
-      left: rect.left,
-    })
+      if (child && typeof child === 'object') {
+        walk(child)
+      }
+    }
   }
 
-  return dedupeCandidates(candidates).sort((a, b) => a.top - b.top)
+  walk(root)
+  candidates.sort((a, b) => b.messages.length - a.messages.length)
+  return candidates[0] || null
 }
 
-function collectUserCandidates() {
-  const main = document.querySelector('main, [role="main"]') as HTMLElement | null
-  if (!main) return [] as MessageCandidate[]
+function findBestMainContainer() {
+  const anchors = Array.from(document.querySelectorAll(`${SELECTORS.user}, ${SELECTORS.assistant}`))
+  const mains = Array.from(document.querySelectorAll(SELECTORS.main)).filter(isVisible)
 
-  const nodes = Array.from(main.querySelectorAll('div, p, span'))
-  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1280
+  if (mains.length) {
+    mains.sort((a, b) => scoreMain(b, anchors) - scoreMain(a, anchors))
+    if (scoreMain(mains[0], anchors) > 0) return mains[0]
+  }
+
+  if (anchors.length) {
+    return lowestCommonAncestor(anchors) || document.body
+  }
+
+  return document.body
+}
+
+function scoreMain(node: Element, anchors: Element[]) {
+  let score = 0
+  for (const anchor of anchors) {
+    if (node.contains(anchor)) score += 10
+  }
+
+  const text = cleanText((node as HTMLElement).innerText || node.textContent || '')
+  if (text.length > 100) score += 1
+  if (isInsideNoise(node)) score -= 100
+
+  return score
+}
+
+function getMessageRoot(node: Element, role: 'user' | 'assistant') {
+  if (role === 'user') {
+    return node.closest('.font-user-message, [data-testid="user-message"]') || node
+  }
+
+  return node.closest('.font-claude-message, .font-claude-response, .group\\/conversation-turn, [class*="conversation-turn"]') || node
+}
+
+function collectSelectorMessages(main: Element) {
   const candidates: MessageCandidate[] = []
 
-  for (const node of nodes) {
-    const htmlEl = node as HTMLElement
-    const content = cleanText(htmlEl.innerText || '')
-    if (!content) continue
-    if (htmlEl.closest('nav, aside, header, footer, [role="navigation"], [role="banner"]')) continue
-    if (htmlEl.closest('.prose, [class*="prose"], [class*="markdown"]')) continue
-    if (shouldSkipElement(htmlEl, content)) continue
-    if (htmlEl.children.length > 4) continue
-
-    const rect = htmlEl.getBoundingClientRect()
-    const layoutRole = inferRoleFromLayout(htmlEl)
-    if (layoutRole !== 'user') continue
-    if (rect.left < viewportWidth * 0.38) continue
-    if (rect.width > viewportWidth * 0.62) continue
-
+  for (const node of Array.from(main.querySelectorAll(SELECTORS.user))) {
+    if (!isVisible(node) || isInsideNoise(node)) continue
+    const root = getMessageRoot(node, 'user')
+    const text = elementToReadableText(root)
+    if (!text) continue
     candidates.push({
       role: 'user',
-      content,
-      top: rect.top,
-      bottom: rect.bottom,
-      left: rect.left,
+      node: root,
+      text,
+      top: safeRect(root)?.top ?? 0,
     })
   }
 
-  return dedupeCandidates(candidates).sort((a, b) => a.top - b.top)
-}
-
-function collectCandidateBlocks() {
-  const main = document.querySelector('main, [role="main"]') as HTMLElement | null
-  if (!main) return [] as MessageCandidate[]
-
-  const candidates: MessageCandidate[] = []
-  const nodes = Array.from(
-    main.querySelectorAll(
-      [
-        'article',
-        'div',
-        'p',
-        'li',
-        'pre',
-        'blockquote',
-        'h2',
-        'h3',
-      ].join(', '),
-    ),
-  )
-
-  for (const node of nodes) {
-    const htmlEl = node as HTMLElement
-    const content = cleanText(htmlEl.innerText || '')
-    if (!content) continue
-    if (content === cleanText(main.innerText || '')) continue
-    if (shouldSkipElement(htmlEl, content)) continue
-
-    const rect = htmlEl.getBoundingClientRect()
-    const role = inferRoleFromLayout(htmlEl) ?? inferRoleFromContent(content, candidates.length)
-
+  for (const node of Array.from(main.querySelectorAll(SELECTORS.assistant))) {
+    if (!isVisible(node) || isInsideNoise(node)) continue
+    if (node.closest(SELECTORS.user)) continue
+    const root = getMessageRoot(node, 'assistant')
+    const text = elementToReadableText(root)
+    if (!text) continue
     candidates.push({
-      role,
-      content,
-      top: rect.top,
-      bottom: rect.bottom,
-      left: rect.left,
+      role: 'assistant',
+      node: root,
+      text,
+      top: safeRect(root)?.top ?? 0,
     })
   }
 
-  candidates.sort((a, b) => a.top - b.top || a.left - b.left)
-
-  return dedupeCandidates(candidates)
+  return dedupeMessages(candidates)
 }
 
-function mergeCandidateBlocks(blocks: MessageCandidate[]) {
-  if (blocks.length === 0) return []
+function directChildOf(parent: Element, descendant: Element) {
+  let current: Element | null = descendant
+  while (current && current.parentElement !== parent) {
+    current = current.parentElement
+  }
+  return current
+}
 
-  const merged: MessageCandidate[] = []
+function findMessageListContainer(userAnchors: Element[], main: Element) {
+  let node: Element | null = userAnchors[0]
 
-  for (const block of blocks) {
-    const previous = merged.at(-1)
-    if (
-      previous
-      && previous.role === block.role
-      && block.top - previous.bottom < 140
-    ) {
-      previous.content = `${previous.content}\n\n${block.content}`.trim()
-      previous.bottom = Math.max(previous.bottom, block.bottom)
+  while (node && node !== document.body && node !== main.parentElement) {
+    const buckets = new Set<Element>()
+
+    for (const anchor of userAnchors) {
+      if (!node.contains(anchor)) continue
+      const direct = directChildOf(node, anchor)
+      if (direct) buckets.add(direct)
+    }
+
+    if (buckets.size >= Math.min(2, userAnchors.length)) {
+      return node
+    }
+
+    node = node.parentElement
+  }
+
+  return main
+}
+
+function looksLikeAssistantBlock(node: Element, main: Element) {
+  if (!isVisible(node) || isInsideNoise(node)) return false
+  if (node.querySelector(SELECTORS.user)) return false
+
+  const text = elementToReadableText(node)
+  if (!text || text.length < 12) return false
+  if (isMostlyNoiseText(text)) return false
+
+  const rect = safeRect(node)
+  const mainRect = safeRect(main)
+  if (!rect || !mainRect) return false
+
+  let score = 0
+
+  if (node.matches(SELECTORS.assistant) || node.querySelector(SELECTORS.assistant)) score += 4
+  if (node.querySelector(SELECTORS.prose)) score += 3
+  if (node.querySelector('p, li, pre, code, blockquote, table, h1, h2, h3')) score += 2
+  if (mainRect.width > 0 && rect.left < mainRect.left + mainRect.width * 0.45) score += 1
+  if (mainRect.width > 0 && rect.width > mainRect.width * 0.35) score += 1
+
+  const actionCount = node.querySelectorAll('button, a, [role="button"]').length
+  const contentCount = node.querySelectorAll('p, li, pre, code, blockquote, table').length
+  if (actionCount > contentCount + 3) score -= 3
+
+  return score >= 3
+}
+
+function collectLayoutMessages(main: Element) {
+  const userAnchors = Array.from(main.querySelectorAll(SELECTORS.user)).filter((node) => isVisible(node) && !isInsideNoise(node))
+  if (!userAnchors.length) return [] as MessageCandidate[]
+
+  const list = findMessageListContainer(userAnchors, main)
+  const children = Array.from(list.children).filter(isVisible)
+  const candidates: MessageCandidate[] = []
+
+  for (const child of children) {
+    if (isInsideNoise(child)) continue
+
+    const userNode = child.querySelector(SELECTORS.user)
+    if (userNode) {
+      const root = getMessageRoot(userNode, 'user')
+      const text = elementToReadableText(root)
+      if (!text) continue
+      candidates.push({
+        role: 'user',
+        node: root,
+        text,
+        top: safeRect(root)?.top ?? 0,
+      })
       continue
     }
 
-    merged.push({ ...block })
+    if (looksLikeAssistantBlock(child, main)) {
+      const text = elementToReadableText(child)
+      if (!text) continue
+      candidates.push({
+        role: 'assistant',
+        node: child,
+        text,
+        top: safeRect(child)?.top ?? 0,
+      })
+    }
   }
 
-  return merged
+  return dedupeMessages(candidates)
 }
 
-function extractMessages(): ExtractedMessage[] {
-  const assistantCandidates = collectAssistantCandidates()
-  const userCandidates = collectUserCandidates()
-  const fallbackCandidates = collectCandidateBlocks()
-  const mergedBlocks = mergeCandidateBlocks(
-    assistantCandidates.length > 0 && userCandidates.length > 0
-      ? [...assistantCandidates, ...userCandidates].sort((a, b) => a.top - b.top || a.left - b.left)
-      : fallbackCandidates,
-  )
-  const messages = uniqueMessages(
-    mergedBlocks.map((block, index) => ({
-      id: `claude-${index}-${Date.now()}`,
-      role: block.role,
-      content: block.content,
-      timestamp: new Date().toISOString(),
-      selected: true,
-    })),
-  )
+function dedupeMessages(messages: MessageCandidate[]) {
+  const sorted = messages
+    .filter((message) => message.text)
+    .sort((a, b) => compareNodeOrder(a.node, b.node))
 
-  if (messages.length > 1 && hasUser(messages) && hasAssistant(messages)) {
-    return messages
+  const out: Array<MessageCandidate & { rect: DOMRect | null }> = []
+
+  for (const message of sorted) {
+    const rect = safeRect(message.node)
+    const duplicate = out.some((previous) => {
+      if (previous.role !== message.role) return false
+
+      const sameText = fingerprint(previous.role, previous.text) === fingerprint(message.role, message.text)
+      const contains =
+        previous.node !== message.node &&
+        (previous.node.contains(message.node) || message.node.contains(previous.node))
+      const closeVertically = Math.abs((previous.rect?.top ?? 0) - (rect?.top ?? Number.MAX_SAFE_INTEGER)) < 4
+
+      return sameText || contains || closeVertically
+    })
+
+    if (!duplicate) {
+      out.push({
+        ...message,
+        rect,
+      })
+    }
   }
 
-  return messages
+  return out.map(({ rect, ...message }) => {
+    void rect
+    return message
+  })
+}
+
+function collapseAdjacentSameRole(messages: MessageCandidate[]) {
+  const out: Array<MessageCandidate & { rect: DOMRect | null }> = []
+
+  for (const message of messages) {
+    const rect = safeRect(message.node)
+    const previous = out[out.length - 1]
+
+    if (
+      previous
+      && previous.role === message.role
+      && previous.rect
+      && rect
+      && rect.top - previous.rect.bottom < 80
+    ) {
+      previous.text = cleanText(`${previous.text}\n\n${message.text}`)
+      previous.rect = rect
+      continue
+    }
+
+    out.push({
+      ...message,
+      rect,
+    })
+  }
+
+  return out.map(({ rect, ...message }) => {
+    void rect
+    return message
+  })
+}
+
+function isMostlyNoiseText(text: string) {
+  const lines = cleanText(text).split('\n').filter(Boolean)
+  if (!lines.length) return true
+
+  const noiseCount = lines.filter((line) => {
+    return isDateOnlyLine(line) || EXACT_UI_LINES.has(line) || /^Shared by\b/i.test(line)
+  }).length
+
+  return noiseCount / lines.length > 0.5
+}
+
+function extractTitleFromMessages(messages: ExtractedMessage[]) {
+  const firstUser = messages.find((message) => message.role === 'user')?.content || ''
+  if (isGoodTitle(firstUser) && firstUser.length >= 8) {
+    return truncateTitle(firstUser)
+  }
+
+  const firstAssistant = messages.find((message) => message.role === 'assistant')?.content || ''
+  const assistantLine = firstAssistant
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => isGoodTitle(line))
+
+  if (assistantLine) return truncateTitle(assistantLine)
+  if (firstUser) return truncateTitle(firstUser)
+  return 'Claude shared conversation'
+}
+
+function isGoodTitle(value: string) {
+  const text = cleanText(value)
+  if (!text || text.length < 4 || text.length > 160) return false
+  if (isDateOnlyLine(text)) return false
+  if (EXACT_UI_LINES.has(text)) return false
+  if (/^Shared by\b/i.test(text)) return false
+  if (/^Claude$/i.test(text)) return false
+  if (/^Start your own conversation$/i.test(text)) return false
+  return true
+}
+
+function truncateTitle(value: string, max = 80) {
+  const text = cleanText(value).replace(/\n+/g, ' ')
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text
+}
+
+function validateMessages(messages: ExtractedMessage[]) {
+  const userCount = messages.filter((message) => message.role === 'user').length
+  const assistantCount = messages.filter((message) => message.role === 'assistant').length
+  const problems: string[] = []
+
+  if (messages.length === 0) problems.push('NO_TURNS')
+  if (userCount > 0 && assistantCount === 0) problems.push('NO_ASSISTANT')
+  if (assistantCount < Math.max(1, userCount - 1)) problems.push('ASSISTANT_COUNT_LOW')
+
+  const assistantText = messages
+    .filter((message) => message.role === 'assistant')
+    .map((message) => message.content)
+    .join('\n')
+
+  if (/New chat|Customize Chats|Projects|Artifacts|Start your own conversation|Shared by/i.test(assistantText)) {
+    problems.push('ASSISTANT_CONTAINS_NAV_NOISE')
+  }
+
+  return {
+    ok: problems.length === 0,
+    problems,
+  }
+}
+
+function flattenCandidates(messages: MessageCandidate[]) {
+  return messages.map((message, index) => ({
+    id: `${extractShareId()}-${index}-${Date.now()}`,
+    role: message.role,
+    content: message.text,
+    timestamp: new Date().toISOString(),
+    selected: true,
+  }))
+}
+
+function extractFromDOM() {
+  const main = findBestMainContainer()
+  const selectorMessages = collectSelectorMessages(main)
+  const selectorAssistantCount = selectorMessages.filter((message) => message.role === 'assistant').length
+  const selectorUserCount = selectorMessages.filter((message) => message.role === 'user').length
+
+  let messages = selectorMessages
+
+  if (selectorAssistantCount === 0 || selectorAssistantCount < Math.max(1, selectorUserCount - 1)) {
+    const layoutMessages = collectLayoutMessages(main)
+    messages = dedupeMessages([...selectorMessages, ...layoutMessages])
+  }
+
+  messages = collapseAdjacentSameRole(messages)
+    .filter((message) => message.text && !isMostlyNoiseText(message.text))
+    .sort((a, b) => compareNodeOrder(a.node, b.node))
+
+  const extracted = flattenCandidates(messages)
+  return {
+    messages: extracted,
+    sourceTitle: getSourceTitle(extracted),
+  }
+}
+
+async function waitForClaudeMessages(timeoutMs = 12000) {
+  const start = Date.now()
+
+  while (Date.now() - start < timeoutMs) {
+    if (document.querySelector(`${SELECTORS.user}, ${SELECTORS.assistant}`)) {
+      await delay(300)
+      return
+    }
+
+    await delay(200)
+  }
+}
+
+async function extractClaudeConversation() {
+  await waitForClaudeMessages()
+
+  const embedded = extractFromEmbeddedJson()
+  if (embedded?.messages.length && validateMessages(embedded.messages).ok) {
+    return embedded
+  }
+
+  return extractFromDOM()
 }
 
 chrome.runtime.onMessage.addListener((msg: { type: string }, _sender: chrome.runtime.MessageSender, sendResponse: (r: unknown) => void) => {
   if (msg.type === 'EXTRACT_CONVERSATION') {
-    const messages = extractMessages()
-    console.log(`[Codex Modified Container] Claude extracted ${messages.length} messages`)
-    sendResponse({ messages, sourceTitle: getSourceTitle() })
+    void extractClaudeConversation()
+      .then((result) => {
+        console.log(`[Codex Modified Container] Claude extracted ${result.messages.length} messages`)
+        sendResponse(result)
+      })
+      .catch((error) => {
+        sendResponse({
+          messages: [],
+          sourceTitle: getSourceTitle(),
+          error: error instanceof Error ? error.message : 'Claude extraction failed',
+        })
+      })
   }
   return true
 })

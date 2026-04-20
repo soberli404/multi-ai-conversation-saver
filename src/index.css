@@ -399,6 +399,29 @@ button {
   margin-bottom: 12px;
 }
 
+.action-outline-button {
+  min-height: 38px;
+  padding: 0 14px;
+  border: 1px solid rgba(145, 113, 99, 0.28);
+  border-radius: 14px;
+  background: rgba(255, 250, 246, 0.98);
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: 0 8px 24px rgba(58, 35, 29, 0.06);
+}
+
+.action-outline-button:hover:not(:disabled) {
+  border-color: rgba(127, 72, 80, 0.4);
+  background: #fffdfb;
+  color: var(--primary);
+}
+
+.action-outline-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .badge {
   display: inline-flex;
   align-items: center;
@@ -467,6 +490,18 @@ button {
 
 .danger-button {
   color: var(--danger);
+}
+
+.action-outline-button.danger-button {
+  color: var(--danger);
+  border-color: rgba(177, 65, 60, 0.22);
+  background: rgba(255, 249, 248, 0.98);
+}
+
+.action-outline-button.danger-button:hover:not(:disabled) {
+  border-color: rgba(177, 65, 60, 0.35);
+  background: #fff8f7;
+  color: #9b2e2a;
 }
 
 .empty-state,

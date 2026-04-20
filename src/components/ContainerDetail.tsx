@@ -52,6 +52,29 @@ function getRunLogs(container: Container): RunLogEntry[] {
   return [...(container.runLogs ?? [])].sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1))
 }
 
+function dedupeImportHistory(conversations: ImportedConversation[]) {
+  const kept = new Map<string, ImportedConversation>()
+  const ordered: ImportedConversation[] = []
+
+  for (const conversation of conversations) {
+    const normalizedUrl = normalizeConversationSourceUrl(conversation.source.url)
+
+    if (!normalizedUrl) {
+      ordered.push(conversation)
+      continue
+    }
+
+    if (kept.has(normalizedUrl)) {
+      continue
+    }
+
+    kept.set(normalizedUrl, conversation)
+    ordered.push(conversation)
+  }
+
+  return ordered
+}
+
 function formatTimestamp(value: string) {
   return new Intl.DateTimeFormat('zh-CN', {
     hour: '2-digit',
@@ -195,15 +218,20 @@ export function ContainerDetail({
 
     await db.messages.replaceForContainer(container.id, toStoredMessages(container.id, drafts))
 
-    await updateContainer((current) => ({
-      ...current,
-      platform: result.conversation.source.platform,
-      sourceUrl: sourceValue?.trim() || current.sourceUrl,
-      importedConversation: result.conversation,
-      importHistory: existingConversation
-        ? getImportHistory(current).map((item) => (item.id === existingConversation.id ? result.conversation : item))
-        : [...getImportHistory(current), result.conversation],
-    }))
+    await updateContainer((current) => {
+      const currentHistory = getImportHistory(current)
+      const nextHistory = existingConversation
+        ? currentHistory.map((item) => (item.id === existingConversation.id ? result.conversation : item))
+        : [...currentHistory, result.conversation]
+
+      return {
+        ...current,
+        platform: result.conversation.source.platform,
+        sourceUrl: sourceValue?.trim() || current.sourceUrl,
+        importedConversation: result.conversation,
+        importHistory: dedupeImportHistory(nextHistory),
+      }
+    })
 
     return result.mode
   }
@@ -447,7 +475,7 @@ export function ContainerDetail({
             </button>
             <button
               type="button"
-              className="icon-button danger-button"
+              className="icon-button action-outline-button danger-button"
               onClick={() => void clearImportedHistory()}
               disabled={stats.conversationCount === 0}
             >
@@ -531,7 +559,7 @@ export function ContainerDetail({
           </div>
           <button
             type="button"
-            className="icon-button"
+            className="icon-button action-outline-button"
             onClick={() => void clearRunLogs()}
             disabled={runLogs.length === 0}
           >
